@@ -122,7 +122,7 @@ const Sync = {
   api(path) { return `${this.base()}${encodeURIComponent(this.cfg.owner)}/${encodeURIComponent(this.cfg.repo)}${path}`; },
   headers() {
     const h = { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" };
-    if (!this.gh) h.Authorization = `Bearer ${this.cfg.token}`;
+    if (!this.gh) h.Authorization = `Bearer ${cleanToken(this.cfg.token)}`;
     return h;
   },
   fileUrl(withRef) {
@@ -211,7 +211,22 @@ const Sync = {
 };
 
 async function errText(r) {
-  try { const j = await r.json(); return `${r.status} ${j.message || ""}`.trim(); } catch { return `${r.status} ${r.statusText}`; }
+  let m = ""; try { m = (await r.json()).message || ""; } catch { m = r.statusText || ""; }
+  return ghMsg(r.status, m);
+}
+// Mensajes de error de GitHub en lenguaje claro
+function ghMsg(s, m = "") {
+  if (s === 401) return "GitHub rechazó el token (401): está mal copiado, vencido o se regeneró después. Pega el valor actual en «GitHub y ajustes».";
+  if (s === 403 && /rate limit/i.test(m)) return "GitHub limitó las peticiones por un rato (403). Espera unos minutos y vuelve a intentar.";
+  if (s === 403) return `Sin permiso (403): el token necesita acceso a este repositorio con «Contents: Read and write».${m ? " GitHub dice: " + m : ""}`;
+  return `${s} ${m}`.trim();
+}
+// Quita espacios y caracteres invisibles que se cuelan al copiar el token
+function cleanToken(t) { return String(t || "").replace(/[\s ​-‍⁠﻿]/g, ""); }
+function tokenProblem(t) {
+  if (/[^\x21-\x7E]/.test(t)) return "El token tiene caracteres extraños (quizá se copió con formato desde un correo o chat). Cópialo de nuevo directo desde GitHub.";
+  if (!/^(github_pat_|ghp_|gho_|ghu_)/.test(t)) return "Esto no parece un token de GitHub: un token fine-grained empieza con «github_pat_». Revisa que lo copiaste completo.";
+  return "";
 }
 function b64enc(str) {
   const bytes = new TextEncoder().encode(str); let bin = "";
@@ -758,23 +773,70 @@ function viewAjustes(v) {
     e.preventDefault();
     const f = Object.fromEntries(new FormData(e.target));
     const via = f.via === "gh" ? "gh" : "token";
-    const cfg = { owner: f.owner.trim(), repo: f.repo.trim(), branch: f.branch.trim() || "main", path: f.path.trim().replace(/^\/+/, "") || "data/proyectos.json", token: via === "token" ? (f.token.trim() || c.token) : c.token, via };
-    const msg = $("#ghMsg", v); msg.innerHTML = `<div class="notice">Probando conexión…</div>`;
+    const cfg = { owner: f.owner.trim().replace(/^@/, ""), repo: f.repo.trim(), branch: f.branch.trim() || "main", path: f.path.trim().replace(/^\/+/, "") || "data/proyectos.json", token: via === "token" ? (cleanToken(f.token) || c.token) : c.token, via };
+    const show = (t, err) => { const m = $("#ghMsg"); if (m) m.innerHTML = `<div class="notice${err ? " err" : ""}">${t}</div>`; else if (err) toast(t.replace(/<[^>]+>/g, ""), 8000); };
+    show("Probando conexión…");
     try {
-      if (via === "token" && !cfg.token) throw new Error("Falta el token de acceso");
+      if (via === "token") {
+        if (!cfg.token) throw new Error("Falta el token de acceso: pégalo en el campo «Token de acceso».");
+        const tp = tokenProblem(cfg.token); if (tp) throw new Error(tp);
+      }
       const h = { Accept: "application/vnd.github+json" };
       if (via === "token") h.Authorization = `Bearer ${cfg.token}`;
-      const base = via === "gh" ? "/gh/repos/" : "https://api.github.com/repos/";
-      const r = await fetch(`${base}${encodeURIComponent(cfg.owner)}/${encodeURIComponent(cfg.repo)}`, { headers: h }).catch(() => null);
-      if (!r) throw new Error(via === "gh" ? "No responde servidor.py. Ábrelo con: python servidor.py --repo usuario/repositorio" : "Sin conexión con GitHub");
-      if (via === "gh" && r.status === 404 && !(r.headers.get("Content-Type") || "").includes("json")) throw new Error("Esta página no se sirvió con servidor.py: ábrela desde http://127.0.0.1:8770 con el servidor corriendo");
-      if (!r.ok) throw new Error(r.status === 404 ? "Repositorio no encontrado o sin acceso a él" : await errText(r));
+      const call = (url, opt = {}) => fetch(url, { headers: h, cache: "no-store", ...opt }).catch(err => {
+        throw new Error(via === "gh" ? "No responde servidor.py. Ábrelo con iniciar_gestor.bat (o elige «Token de acceso» si estás en otra PC)."
+          : navigator.onLine === false ? "Este equipo no tiene internet."
+          : `No se pudo contactar a GitHub: puede ser la red, un firewall o una extensión del navegador que bloquea api.github.com. (${err.message})`);
+      });
+      const full = `${cfg.owner}/${cfg.repo}`;
+      const repoUrl = `${via === "gh" ? "/gh/repos/" : "https://api.github.com/repos/"}${encodeURIComponent(cfg.owner)}/${encodeURIComponent(cfg.repo)}`;
+      const fileUrl = `${repoUrl}/contents/${cfg.path.split("/").map(encodeURIComponent).join("/")}`;
+
+      // 1) ¿El token es válido?
+      let login = "";
+      if (via === "token") {
+        show("1/4 · Revisando el token…");
+        const u = await call("https://api.github.com/user");
+        if (u.status === 401) throw new Error("Paso 1/4 · GitHub rechazó el token (401): está mal copiado, vencido, o lo regeneraste después de copiarlo. Copia el valor actual (empieza con github_pat_).");
+        if (u.ok) login = (await u.json()).login || "";
+      }
+      // 2) ¿Tiene acceso al repositorio?
+      show("2/4 · Revisando el repositorio…");
+      const r = await call(repoUrl);
+      if (via === "gh" && r.status === 404 && !(r.headers.get("Content-Type") || "").includes("json")) throw new Error("Esta página no se sirvió con servidor.py: en otra PC elige «Token de acceso»; en tu PC ábrela con iniciar_gestor.bat.");
+      if (r.status === 404) throw new Error(`Paso 2/4 · El token${login ? ` (de ${login})` : ""} es válido, pero no ve el repositorio «${full}». Revisa que usuario y repositorio estén bien escritos, y que el token tenga Repository access → Only select repositories → ${cfg.repo || "el repositorio"}.`);
+      if (!r.ok) throw new Error("Paso 2/4 · " + await errText(r));
       const repo = await r.json();
-      if (!repo.permissions?.push) throw new Error("El token puede leer pero no escribir: dale permiso Contents: Read and write");
+      if (via === "gh" && !repo.permissions?.push) throw new Error("Tu sesión de GitHub CLI no puede escribir en ese repositorio.");
+      // 3) ¿Existen la rama y el archivo?
+      show("3/4 · Buscando el archivo de datos…");
+      const fr = await call(`${fileUrl}?ref=${encodeURIComponent(cfg.branch)}`);
+      let file = null;
+      if (fr.ok) file = await fr.json();
+      else if (fr.status === 404) {
+        const m = (await fr.json().catch(() => ({}))).message || "";
+        if (/ref|branch|commit/i.test(m)) throw new Error(`Paso 3/4 · La rama «${cfg.branch}» no existe en ${repo.full_name}. Prueba con «${repo.default_branch}».`);
+      } else throw new Error("Paso 3/4 · " + await errText(fr));
+      // 4) ¿Puede escribir? Prueba sin modificar nada: se envía el mismo contenido con un sha falso,
+      //    así GitHub responde 409 (permitido, pero no guarda) o 403 (sin permiso de escritura).
+      if (via === "token" && file && file.content) {
+        show("4/4 · Revisando permiso de escritura…");
+        const w = await call(fileUrl, { method: "PUT", body: JSON.stringify({ message: "Prueba de permisos (no se guarda)", content: String(file.content).replace(/\s/g, ""), sha: "0".repeat(40), branch: cfg.branch }) });
+        if (w.status === 403 || w.status === 404) throw new Error("Paso 4/4 · El token puede leer pero no escribir. En GitHub abre el token → Permissions → Contents: «Read and write» y guarda (no hace falta regenerarlo).");
+        if (w.status === 401) throw new Error("Paso 4/4 · " + ghMsg(401));
+      }
+      if (!file) {
+        if (!confirm(`El archivo «${cfg.path}» no existe en ${repo.full_name} (rama ${cfg.branch}).\n\n¿Crearlo con los ${DB.proyectos.length} proyectos de este navegador?\n\nSi tus datos ya están en GitHub, pulsa Cancelar y revisa el campo «Archivo» (normalmente data/proyectos.json).`))
+          throw new Error("Conexión cancelada: revisa el campo «Archivo».");
+      } else if (lsGet(LS_DIRTY, false) && DB.proyectos.length) {
+        if (!confirm(`Este navegador tiene cambios que nunca se subieron a GitHub (${DB.proyectos.length} proyectos, quizá los de ejemplo).\n\nAceptar = combinarlos con los de GitHub.\nCancelar = descartarlos y usar solo lo que está en GitHub.`)) lsSet(LS_DIRTY, false);
+      }
       Sync.cfg = cfg; lsSet(LS_GH, cfg); Sync.sha = null; lsSet("idgestor.ghAutoOff", false);
-      msg.innerHTML = `<div class="notice">Conectado a <b>${esc(repo.full_name)}</b>${repo.private ? " (privado)" : " — <b>ojo: el repositorio es público</b>"}. Sincronizando…</div>`;
-      await Sync.init(); render(); toast("GitHub conectado");
-    } catch (err) { msg.innerHTML = `<div class="notice err">${esc(err.message)}</div>`; }
+      show(`Conectado a <b>${esc(repo.full_name)}</b>${repo.private ? " (privado)" : " — <b>ojo: el repositorio es público</b>"}. Sincronizando…`);
+      await Sync.init();
+      if (Sync.state === "err") throw new Error("Conectó, pero falló la sincronización: " + Sync.error);
+      render(); toast("GitHub conectado");
+    } catch (err) { show(esc(err.message), true); }
   };
   const viaSel = $("#ghVia", v), showVia = () => { $("#ghTok", v).hidden = viaSel.value === "gh"; $("#ghCli", v).hidden = viaSel.value !== "gh"; };
   viaSel.onchange = showVia; showVia();
